@@ -1,0 +1,12 @@
+<resources>
+    <color name="bg">#12181D</color>
+    <color name="panel">#1B232A</color>
+    <color name="ink">#E4EAEF</color>
+    <color name="muted">#94A3B0</color>
+    <color name="line">#2E3A44</color>
+    <color name="steel">#8FB0C6</color>
+    <color name="mark">#F2BE00</color>
+    <color name="ok">#4CC27F</color>
+    <color name="bad">#F06B5A</color>
+    <color name="field">#141B21</color>
+</resources>

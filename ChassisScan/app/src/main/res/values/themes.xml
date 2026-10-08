@@ -1,0 +1,39 @@
+<resources>
+    <style name="Theme.ChassisScan" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/steel</item>
+        <item name="colorOnPrimary">@color/bg</item>
+        <item name="colorSecondary">@color/mark</item>
+        <item name="colorOnSecondary">#1C2630</item>
+        <item name="android:colorBackground">@color/bg</item>
+        <item name="colorSurface">@color/panel</item>
+        <item name="colorOnSurface">@color/ink</item>
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:windowLightStatusBar">@bool/light_status</item>
+    </style>
+
+    <style name="Value">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:background">@drawable/field_bg</item>
+        <item name="android:padding">12dp</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textSize">19sp</item>
+        <item name="android:letterSpacing">0.06</item>
+        <item name="android:textColor">@color/ink</item>
+        <item name="android:textColorHint">@color/muted</item>
+        <item name="android:inputType">textCapCharacters|textNoSuggestions|textVisiblePassword</item>
+        <item name="android:imeOptions">actionDone</item>
+        <item name="android:maxLines">1</item>
+    </style>
+
+    <style name="Label">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textColor">@color/muted</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:layout_marginBottom">4dp</item>
+    </style>
+</resources>
