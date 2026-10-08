@@ -6,15 +6,16 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Matrix
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.net.Uri
 import android.os.Bundle
 import android.text.Editable
-import android.text.SpannableStringBuilder
 import android.text.TextWatcher
-import android.text.style.ForegroundColorSpan
 import android.util.Size
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,6 +34,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import com.google.android.gms.tasks.Tasks
 import com.google.android.material.chip.Chip
+import com.google.android.material.chip.ChipGroup
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -51,9 +53,10 @@ import java.util.concurrent.Executors
 class MainActivity : AppCompatActivity() {
 
     private lateinit var b: ActivityMainBinding
-    private lateinit var analysisExecutor: ExecutorService
+    private lateinit var worker: ExecutorService
     private var camera: Camera? = null
     private var torchOn = false
+    private var tone: ToneGenerator? = null
 
     private val barcodeScanner = BarcodeScanning.getClient(
         BarcodeScannerOptions.Builder()
@@ -62,25 +65,28 @@ class MainActivity : AppCompatActivity() {
     )
     private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
-    // State shared with the analysis thread
+    // State shared with the worker thread
     @Volatile private var stampMode = false
+    @Volatile private var vertical = false
     @Volatile private var qrScanning = true
     @Volatile private var stampFramesLeft = 0
+    @Volatile private var photoBusy = false
     @Volatile private var viewW = 0
     @Volatile private var viewH = 0
-    private val stampReads = mutableListOf<Chassis.OcrPick>()
-
-    private var qrFields: List<Field> = emptyList()
+    private val attempts = mutableListOf<List<String>>()
 
     private val askCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-        if (ok) startCamera() else status("Camera permission is needed to scan. Allow it in Settings > Apps > Chassis Scan.", true)
+        if (ok) startCamera() else status("Camera permission is needed to scan. You can still use From photo.", true)
+    }
+    private val pickPhoto = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) readPhoto(uri)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         b = ActivityMainBinding.inflate(layoutInflater)
         setContentView(b.root)
-        analysisExecutor = Executors.newSingleThreadExecutor()
+        worker = Executors.newSingleThreadExecutor()
 
         b.previewView.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ -> viewW = v.width; viewH = v.height }
 
@@ -89,13 +95,30 @@ class MainActivity : AppCompatActivity() {
         }
         b.btnRead.setOnClickListener { readStampNow() }
         b.btnAgain.setOnClickListener { setMode(stampMode) }
+        b.btnOrient.setOnClickListener {
+            vertical = !vertical
+            b.guideView.vertical = vertical
+            b.btnOrient.text = if (vertical) "Box: horizontal" else "Box: vertical"
+        }
+        b.btnPhoto.setOnClickListener { pickPhoto.launch("image/*") }
         b.btnTorch.setOnClickListener {
             torchOn = !torchOn
             camera?.cameraControl?.enableTorch(torchOn)
             b.btnTorch.text = if (torchOn) "Light off" else "Light on"
         }
+
+        // Pinch to zoom, tap to focus
+        val scale = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(d: ScaleGestureDetector): Boolean {
+                val cam = camera ?: return true
+                val z = cam.cameraInfo.zoomState.value ?: return true
+                cam.cameraControl.setZoomRatio((z.zoomRatio * d.scaleFactor).coerceIn(z.minZoomRatio, z.maxZoomRatio))
+                return true
+            }
+        })
         b.previewView.setOnTouchListener { v, e ->
-            if (e.action == MotionEvent.ACTION_UP) {
+            scale.onTouchEvent(e)
+            if (e.action == MotionEvent.ACTION_UP && !scale.isInProgress && e.pointerCount == 1) {
                 val pt = b.previewView.meteringPointFactory.createPoint(e.x, e.y)
                 camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
                 v.performClick()
@@ -110,11 +133,14 @@ class MainActivity : AppCompatActivity() {
         }
         b.qrVal.addTextChangedListener(watcher)
         b.stVal.addTextChangedListener(watcher)
-        b.btnCopyQr.setOnClickListener { copy(Chassis.norm(b.qrVal.text.toString())) }
-        b.btnCopySt.setOnClickListener { copy(Chassis.norm(b.stVal.text.toString())) }
+        b.btnCopyQr.setOnClickListener { copy(b.qrVal.text.toString().trim()) }
+        b.btnCopySt.setOnClickListener { copy(b.stVal.text.toString().trim()) }
         b.btnSave.setOnClickListener { saveRecord() }
         b.btnClear.setOnClickListener {
-            b.qrVal.setText(""); b.stVal.setText(""); showFields(emptyList()); status("")
+            b.qrVal.setText(""); b.stVal.setText("")
+            showChips(b.qrFields, b.qrFieldsLabel, emptyList(), b.qrVal)
+            showChips(b.stFields, b.stFieldsLabel, emptyList(), b.stVal)
+            status("")
         }
         b.btnShare.setOnClickListener { shareCsv() }
         b.btnDeleteAll.setOnClickListener {
@@ -133,9 +159,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        analysisExecutor.shutdown()
+        worker.shutdown()
         barcodeScanner.close()
         textRecognizer.close()
+        tone?.release()
     }
 
     // ---------- camera ----------
@@ -155,7 +182,7 @@ class MainActivity : AppCompatActivity() {
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
-            analysis.setAnalyzer(analysisExecutor) { proxy -> analyze(proxy) }
+            analysis.setAnalyzer(worker) { proxy -> analyze(proxy) }
             try {
                 provider.unbindAll()
                 camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
@@ -167,58 +194,68 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun analyze(proxy: ImageProxy) {
-        val wantQr = !stampMode && qrScanning
-        val wantStamp = stampMode && stampFramesLeft > 0
+        val wantQr = !stampMode && qrScanning && !photoBusy
+        val wantStamp = stampMode && stampFramesLeft > 0 && !photoBusy
         if (!wantQr && !wantStamp) { proxy.close(); return }
 
-        val bmp: Bitmap
-        try {
-            val raw = proxy.toBitmap()
-            val rot = proxy.imageInfo.rotationDegrees
-            bmp = if (rot == 0) raw else Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height,
-                Matrix().apply { postRotate(rot.toFloat()) }, true)
-        } catch (e: Exception) {
-            if (wantStamp) {
-                stampFramesLeft -= 1
-                if (stampFramesLeft <= 0) runOnUiThread { finishStampRead() }
-            }
-            return
-        } finally {
-            proxy.close()
-        }
+        val bmp: Bitmap? = try {
+            ImageTools.rotate(proxy.toBitmap(), proxy.imageInfo.rotationDegrees)
+        } catch (_: Exception) { null } finally { proxy.close() }
 
         if (wantQr) {
-            try {
-                val codes = Tasks.await(barcodeScanner.process(InputImage.fromBitmap(bmp, 0)))
-                val value = codes.firstOrNull { !it.rawValue.isNullOrEmpty() }?.rawValue
-                if (value != null && qrScanning && !stampMode) {
-                    qrScanning = false
-                    runOnUiThread { onQr(value) }
-                }
-            } catch (_: Exception) {}
+            if (bmp == null) return
+            val value = decodeQr(bmp)
+            if (value != null && qrScanning && !stampMode) {
+                qrScanning = false
+                runOnUiThread { onQr(value) }
+            }
         } else {
-            try {
-                val crop = cropToGuide(bmp)
-                val text = Tasks.await(textRecognizer.process(InputImage.fromBitmap(crop, 0)))
-                val lines = text.textBlocks.flatMap { blk -> blk.lines.map { it.text } }
-                val pick = Chassis.pickFromOcr(lines)
-                synchronized(stampReads) { if (pick != null) stampReads.add(pick) }
-            } catch (_: Exception) {}
+            if (bmp != null) {
+                val rotations = if (vertical) listOf(90, 270) else listOf(0)
+                val got = recognize(cropToGuide(bmp), rotations)
+                synchronized(attempts) { attempts.addAll(got) }
+            }
             stampFramesLeft -= 1
-            if (stampFramesLeft <= 0) runOnUiThread { finishStampRead() }
+            if (stampFramesLeft <= 0) runOnUiThread { finishStampRead("camera") }
         }
+    }
+
+    private fun decodeQr(bmp: Bitmap): String? = try {
+        Tasks.await(barcodeScanner.process(InputImage.fromBitmap(bmp, 0)))
+            .firstOrNull { !it.rawValue.isNullOrEmpty() }?.rawValue
+    } catch (_: Exception) { null }
+
+    /**
+     * Runs text recognition on each rotation, on both the plain and the contrast-enhanced image.
+     * Returns one list of lines per pass.
+     */
+    private fun recognize(src: Bitmap, rotations: List<Int>): List<List<String>> {
+        val out = mutableListOf<List<String>>()
+        val sized = ImageTools.sizeForOcr(src)
+        val versions = listOf(sized, ImageTools.enhance(sized))
+        for (rot in rotations) {
+            for (v in versions) {
+                try {
+                    val img = ImageTools.rotate(v, rot)
+                    val text = Tasks.await(textRecognizer.process(InputImage.fromBitmap(img, 0)))
+                    out.add(text.textBlocks.flatMap { blk -> blk.lines.map { it.text } })
+                } catch (_: Exception) {}
+            }
+        }
+        return out
     }
 
     /** Crops the analysis frame to the yellow box the user sees (preview uses FILL_CENTER). */
     private fun cropToGuide(bmp: Bitmap): Bitmap {
         val vw = viewW.toFloat(); val vh = viewH.toFloat()
         if (vw <= 0f || vh <= 0f) return bmp
+        val (fw, fh) = b.guideView.bandFractions()
         val scale = maxOf(vw / bmp.width, vh / bmp.height)
-        val cw = (vw * GuideView.STAMP_W * 1.06f / scale).coerceAtMost(bmp.width.toFloat())
-        val ch = (vh * GuideView.STAMP_H * 1.15f / scale).coerceAtMost(bmp.height.toFloat())
+        val cw = (vw * fw * 1.08f / scale).coerceAtMost(bmp.width.toFloat())
+        val ch = (vh * fh * 1.08f / scale).coerceAtMost(bmp.height.toFloat())
         val x = ((bmp.width - cw) / 2).toInt().coerceAtLeast(0)
         val y = ((bmp.height - ch) / 2).toInt().coerceAtLeast(0)
-        return Bitmap.createBitmap(bmp, x, y, cw.toInt().coerceAtMost(bmp.width - x), ch.toInt().coerceAtMost(bmp.height - y))
+        return Bitmap.createBitmap(bmp, x, y, cw.toInt().coerceIn(1, bmp.width - x), ch.toInt().coerceIn(1, bmp.height - y))
     }
 
     // ---------- modes ----------
@@ -228,10 +265,11 @@ class MainActivity : AppCompatActivity() {
         b.guideView.stampMode = stamp
         b.btnAgain.visibility = View.GONE
         b.btnRead.visibility = if (stamp) View.VISIBLE else View.GONE
+        b.btnOrient.visibility = if (stamp) View.VISIBLE else View.GONE
         b.btnRead.isEnabled = true
         if (stamp) {
             qrScanning = false
-            status("Fit only the stamped number inside the box, light it from the side, then tap Read number.")
+            status("Fit only the number inside the box. Pinch to zoom, tap to focus, light from the side, then tap Read number.")
         } else {
             qrScanning = true
             status("Point at the QR label. It reads automatically.")
@@ -241,71 +279,100 @@ class MainActivity : AppCompatActivity() {
     // ---------- QR ----------
 
     private fun onQr(raw: String) {
-        b.previewView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        beep()
         b.btnAgain.visibility = View.VISIBLE
-        qrFields = Chassis.parsePayload(raw)
-        val picked = Chassis.pickFromQr(qrFields, raw)
+        val fields = Chassis.parsePayload(raw)
+        val picked = Chassis.pickFromQr(fields, raw)
         if (picked != null) {
             b.qrVal.setText(picked)
-            status("QR read. Chassis number picked. Tap a field below if it chose the wrong one.")
+            status(if (fields.size > 1) "QR read. Tap a field below if it chose the wrong one." else "QR read.")
         } else {
             b.qrVal.setText("")
-            status("QR read, but no chassis field found. Tap the right field below.", true)
+            status("QR read. Tap the field that is the chassis number.", true)
         }
-        showFields(qrFields)
+        showChips(b.qrFields, b.qrFieldsLabel,
+            if (fields.size > 1) fields.map { (if (it.key.isNotEmpty()) "${it.key}: " else "") + it.value to it.value.trim() } else emptyList(),
+            b.qrVal)
     }
 
-    private fun showFields(fields: List<Field>) {
-        b.qrFields.removeAllViews()
-        b.qrFieldsLabel.visibility = if (fields.size > 1) View.VISIBLE else View.GONE
-        if (fields.size <= 1) return
-        val current = Chassis.norm(b.qrVal.text.toString())
-        fields.forEach { f ->
-            val chip = Chip(this).apply {
-                text = if (f.key.isNotEmpty()) "${f.key}: ${f.value}" else f.value
+    /** Shows options as chips; tapping one puts its value in the target box. Items are (label, value). */
+    private fun showChips(group: ChipGroup, label: View, items: List<Pair<String, String>>, target: android.widget.EditText) {
+        group.removeAllViews()
+        label.visibility = if (items.isNotEmpty()) View.VISIBLE else View.GONE
+        val current = target.text.toString().trim()
+        items.forEach { (text, value) ->
+            group.addView(Chip(this).apply {
+                this.text = text
                 isCheckable = true
-                isChecked = current.isNotEmpty() && Chassis.norm(f.value) == current
-                setOnClickListener { b.qrVal.setText(Chassis.norm(f.value)) }
-            }
-            b.qrFields.addView(chip)
+                isChecked = value == current
+                setOnClickListener { target.setText(value) }
+            })
         }
     }
 
     // ---------- stamped number ----------
 
     private fun readStampNow() {
-        synchronized(stampReads) { stampReads.clear() }
+        synchronized(attempts) { attempts.clear() }
         b.btnRead.isEnabled = false
         status("Reading… hold steady.")
         stampFramesLeft = STAMP_FRAMES
     }
 
-    /** Votes across several frames so one blurry frame does not decide the result. */
-    private fun finishStampRead() {
+    private fun readPhoto(uri: Uri) {
+        if (photoBusy) return
+        photoBusy = true
+        b.btnPhoto.isEnabled = false
+        status("Reading the photo…")
+        val qr = !stampMode
+        worker.execute {
+            val bmp = ImageTools.load(this, uri)
+            if (bmp == null) {
+                runOnUiThread { photoBusy = false; b.btnPhoto.isEnabled = true; status("Could not open that photo.", true) }
+                return@execute
+            }
+            if (qr) {
+                val v = decodeQr(bmp)
+                runOnUiThread {
+                    photoBusy = false; b.btnPhoto.isEnabled = true
+                    if (v != null) { qrScanning = false; onQr(v) } else status("No QR code found in that photo.", true)
+                }
+            } else {
+                // Photo direction is unknown, so try all four.
+                val got = recognize(bmp, listOf(0, 90, 180, 270))
+                synchronized(attempts) { attempts.clear(); attempts.addAll(got) }
+                runOnUiThread { photoBusy = false; b.btnPhoto.isEnabled = true; finishStampRead("photo") }
+            }
+        }
+    }
+
+    /** Picks the reading most passes agreed on; the rest are offered as chips. */
+    private fun finishStampRead(source: String) {
         b.btnRead.isEnabled = true
-        val reads = synchronized(stampReads) { stampReads.toList() }
-        if (reads.isEmpty()) {
-            status("No number found. Move closer, fill the box with the number, light it from the side, and try again. You can also type it.", true)
+        val ranked = synchronized(attempts) { Chassis.rank(attempts.toList()) to attempts.size }
+        val list = ranked.first; val passes = ranked.second
+        if (list.isEmpty()) {
+            showChips(b.stFields, b.stFieldsLabel, emptyList(), b.stVal)
+            status(if (source == "photo") "No number found in that photo. Try a closer, sharper photo, or type it."
+                   else "No number found. Zoom in, fill the box with the number, light it from the side, and try again. You can also type it.", true)
             return
         }
-        val groups = reads.groupBy { it.value }
-        val best = groups.entries.maxWith(compareBy<Map.Entry<String, List<Chassis.OcrPick>>> { it.value.size }
-            .thenBy { e -> e.value.maxOf { it.score } }).key
-        val agree = groups[best]!!.size
-        b.stVal.setText(best)
-        b.previewView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-        val sure = agree >= (STAMP_FRAMES + 1) / 2
-        status("Read $agree of $STAMP_FRAMES frames the same. " +
-                if (sure) "Check it against the frame." else "Unsure: check each character, or read again.", !sure)
+        val best = list[0]
+        b.stVal.setText(best.first)
+        showChips(b.stFields, b.stFieldsLabel, list.take(8).map { "${it.first}  (${it.second})" to it.first }, b.stVal)
+        beep()
+        val strong = best.second >= 2
+        status("Read \"${best.first}\" in ${best.second} of $passes passes. " +
+                if (strong) "Check it against the part." else "Unsure: check it, tap another reading below, or read again.", !strong)
     }
 
     // ---------- compare ----------
 
     private fun refresh() {
-        val a = Chassis.norm(b.qrVal.text.toString())
-        val s = Chassis.norm(b.stVal.text.toString())
-        b.qrChecks.text = checksText(a)
-        b.stChecks.text = checksText(s)
+        val qrRaw = b.qrVal.text.toString().trim(); val stRaw = b.stVal.text.toString().trim()
+        b.qrChecks.text = if (qrRaw.isEmpty()) "" else "${qrRaw.length} characters"
+        b.stChecks.text = if (stRaw.isEmpty()) "" else "${stRaw.length} characters"
+        val a = Chassis.norm(qrRaw); val s = Chassis.norm(stRaw)
         if (a.isNotEmpty() && s.isNotEmpty()) {
             val same = a == s
             b.verdict.text = if (same) "Match: QR label and stamped number are the same." else "Mismatch: " + Chassis.diff(a, s)
@@ -316,18 +383,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun checksText(v: String): CharSequence {
-        val sb = SpannableStringBuilder()
-        Chassis.checks(v).forEachIndexed { i, (t, bad) ->
-            if (i > 0) sb.append(" · ")
-            val start = sb.length
-            sb.append(t)
-            val c = when (bad) { true -> R.color.bad; false -> R.color.ok; null -> R.color.muted }
-            sb.setSpan(ForegroundColorSpan(color(c)), start, sb.length, 0)
-        }
-        return sb
-    }
-
     // ---------- records ----------
 
     private fun prefs() = getSharedPreferences("records", MODE_PRIVATE)
@@ -336,8 +391,8 @@ class MainActivity : AppCompatActivity() {
         try { JSONArray(prefs().getString(KEY, "[]")) } catch (_: Exception) { JSONArray() }
 
     private fun saveRecord() {
-        val qr = Chassis.norm(b.qrVal.text.toString())
-        val st = Chassis.norm(b.stVal.text.toString())
+        val qr = b.qrVal.text.toString().trim()
+        val st = b.stVal.text.toString().trim()
         if (qr.isEmpty() && st.isEmpty()) { status("Nothing to save yet.", true); return }
         val old = loadRecords()
         val list = JSONArray().put(JSONObject().put("t", System.currentTimeMillis()).put("qr", qr).put("st", st))
@@ -349,7 +404,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun result(qr: String, st: String) =
-        if (qr.isEmpty() || st.isEmpty()) "-" else if (qr == st) "MATCH" else "MISMATCH"
+        if (qr.isEmpty() || st.isEmpty()) "-" else if (Chassis.norm(qr) == Chassis.norm(st)) "MATCH" else "MISMATCH"
 
     private fun renderRecords() {
         val list = loadRecords()
@@ -366,6 +421,8 @@ class MainActivity : AppCompatActivity() {
         b.records.text = sb.trimEnd()
     }
 
+    private fun csv(v: String) = if (v.any { it == ',' || it == '"' || it == '\n' }) "\"" + v.replace("\"", "\"\"") + "\"" else v
+
     private fun shareCsv() {
         val list = loadRecords()
         if (list.length() == 0) { status("No records to share.", true); return }
@@ -374,7 +431,7 @@ class MainActivity : AppCompatActivity() {
         for (i in 0 until list.length()) {
             val r = list.getJSONObject(i)
             val qr = r.optString("qr"); val st = r.optString("st")
-            sb.append(fmt.format(Date(r.optLong("t")))).append(',').append(qr).append(',').append(st)
+            sb.append(fmt.format(Date(r.optLong("t")))).append(',').append(csv(qr)).append(',').append(csv(st))
                 .append(',').append(result(qr, st).lowercase()).append('\n')
         }
         startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
@@ -393,6 +450,15 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "Copied $v", Toast.LENGTH_SHORT).show()
     }
 
+    /** Scanner beep plus a short vibration when a value has been read. */
+    private fun beep() {
+        b.previewView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        try {
+            if (tone == null) tone = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
+            tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 200)
+        } catch (_: Exception) {}
+    }
+
     private fun color(id: Int) = ContextCompat.getColor(this, id)
 
     private fun status(t: String, err: Boolean = false) {
@@ -402,6 +468,6 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val KEY = "list"
-        private const val STAMP_FRAMES = 5
+        private const val STAMP_FRAMES = 3
     }
 }
