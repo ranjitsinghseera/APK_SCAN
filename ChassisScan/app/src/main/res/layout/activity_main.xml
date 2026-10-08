@@ -62,7 +62,7 @@
                 android:layout_width="0dp"
                 android:layout_height="0dp"
                 android:background="#0D1114"
-                app:layout_constraintDimensionRatio="H,4:3"
+                app:layout_constraintDimensionRatio="H,1:1"
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintTop_toTopOf="parent" />
@@ -120,6 +120,31 @@
                 android:layout_weight="1"
                 android:text="Scan again"
                 android:visibility="gone" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnOrient"
+                style="?attr/materialButtonOutlinedStyle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:layout_weight="1"
+                android:text="Box: vertical"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/btnPhoto"
+                style="?attr/materialButtonOutlinedStyle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="From photo" />
         </LinearLayout>
 
         <com.google.android.material.card.MaterialCardView
@@ -215,6 +240,22 @@
                     android:layout_marginTop="4dp"
                     android:textColor="@color/muted"
                     android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/stFieldsLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Other readings (tap to use):"
+                    android:textColor="@color/muted"
+                    android:textSize="13sp"
+                    android:visibility="gone" />
+
+                <com.google.android.material.chip.ChipGroup
+                    android:id="@+id/stFields"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    app:singleSelection="true" />
 
                 <TextView
                     android:id="@+id/verdict"
