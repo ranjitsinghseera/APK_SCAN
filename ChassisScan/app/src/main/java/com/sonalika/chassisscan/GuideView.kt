@@ -17,10 +17,6 @@ class GuideView @JvmOverloads constructor(
     var stampMode = false
         set(value) { field = value; invalidate() }
 
-    /** Stamped number running top-to-bottom instead of left-to-right. */
-    var vertical = false
-        set(value) { field = value; invalidate() }
-
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#F2BE00")
         style = Paint.Style.STROKE
@@ -30,14 +26,9 @@ class GuideView @JvmOverloads constructor(
     private val shade = Paint().apply { color = Color.parseColor("#55000000") }
     private val path = Path()
 
-    /** Box size as fractions of the view (width, height). */
-    fun bandFractions(): Pair<Float, Float> =
-        if (vertical) BAND_SHORT to BAND_LONG else BAND_LONG to BAND_SHORT
-
-    private fun guideRect(w: Float, h: Float): RectF {
+    fun guideRect(w: Float, h: Float): RectF {
         return if (stampMode) {
-            val (fw, fh) = bandFractions()
-            val gw = w * fw; val gh = h * fh
+            val gw = w * STAMP_W; val gh = h * STAMP_H
             RectF((w - gw) / 2, (h - gh) / 2, (w + gw) / 2, (h + gh) / 2)
         } else {
             val s = minOf(w, h) * QR_SIZE
@@ -65,8 +56,8 @@ class GuideView @JvmOverloads constructor(
     }
 
     companion object {
-        const val BAND_LONG = 0.92f
-        const val BAND_SHORT = 0.34f
-        const val QR_SIZE = 0.75f
+        const val STAMP_W = 0.90f
+        const val STAMP_H = 0.32f
+        const val QR_SIZE = 0.70f
     }
 }
